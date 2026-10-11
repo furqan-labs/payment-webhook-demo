@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>payment-webhook-demo</title>
+<style>
+  :root { --bg:#0f1319; --card:#171d26; --line:#273140; --ink:#e8edf3; --mute:#93a1b3; --ok:#34c38f; --bad:#f06a6a; --warn:#f0b34a; --accent:#6aa8ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 28px 18px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lead { color: var(--mute); margin: 0 0 22px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--mute); margin: 0 0 12px; }
+  button { font: inherit; color: var(--ink); background: #212a37; border: 1px solid var(--line); border-radius: 8px; padding: 9px 14px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #07101d; border-color: var(--accent); font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .status { display:inline-block; padding: 3px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; background:#2a3342; }
+  .status.paid { background: rgba(52,195,143,.18); color: var(--ok); }
+  .status.pending { background: rgba(240,179,74,.18); color: var(--warn); }
+  .status.expired, .status.failed, .status.amount_mismatch { background: rgba(240,106,106,.18); color: var(--bad); }
+  .scenario { display:grid; grid-template-columns: 1fr auto; gap: 10px; align-items:center; padding: 10px 0; border-top: 1px solid var(--line); }
+  .scenario:first-of-type { border-top: 0; }
+  .scenario small { color: var(--mute); display:block; }
+  .log { font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  .entry { padding: 8px 0; border-top: 1px solid var(--line); }
+  .entry:first-child { border-top: 0; }
+  .code { display:inline-block; min-width: 38px; padding: 1px 7px; border-radius: 6px; background:#2a3342; }
+  .code.ok { color: var(--ok); } .code.err { color: var(--bad); }
+  .note { color: var(--mute); }
+  .banner { border:1px dashed var(--line); border-radius:10px; padding:10px 12px; color: var(--mute); margin-bottom:16px; font-size: 13px; }
+  code { background:#212a37; padding:1px 5px; border-radius:5px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>payment-webhook-demo</h1>
+  <p class="lead">Create an order, then fire webhook scenarios at the real handler and watch what it does.</p>
+  <div class="banner">This page runs in <b>demo mode</b>: a simulator stands in for Stripe's Checkout page, so no account or keys are needed. The webhook route, the signature check, the database and the order logic are the production code.</div>
+
+  <div class="card">
+    <h2>1. Create an order</h2>
+    <div class="row">
+      <button class="primary" data-sku="sticker">Order a sticker pack ($5.00)</button>
+      <button class="primary" data-sku="mug">Order a mug ($15.00)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. Order</h2>
+    <div id="order">No order yet.</div>
+  </div>
+
+  <div class="card">
+    <h2>3. Send a webhook scenario</h2>
+    <div id="scenarios"></div>
+  </div>
+
+  <div class="card">
+    <h2>What the handler answered</h2>
+    <div id="log" class="log"><span class="note">Nothing sent yet.</span></div>
+  </div>
+</main>
+<script>
+const SCENARIOS = [
+  ['pay', 'Pay (valid event)', 'A correctly signed "payment completed" event for the right amount.'],
+  ['duplicate', 'Send the same event twice', 'Stripe can redeliver events. The second one must not be processed again.'],
+  ['delayed', 'Delayed payment (bank transfer)', 'Session completes unpaid, money arrives later in a second event.'],
+  ['tampered', 'Tamper with a signed event', 'Change the body after signing, as an attacker might.'],
+  ['wrong_secret', 'Forge the signature', 'Sign with a secret the server does not know.'],
+  ['wrong_amount', 'Valid signature, wrong amount', 'Stripe reports 1 cent paid for a larger order.'],
+  ['expire', 'Customer never pays', 'The checkout session expires.'],
+];
+let orderId = null;
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+$('#scenarios').innerHTML = SCENARIOS.map(([id, title, desc]) =>
+  `<div class="scenario"><div>${esc(title)}<small>${esc(desc)}</small></div><button data-scenario="${id}" disabled>Send</button></div>`).join('');
+
+async function refresh() {
+  if (!orderId) return;
+  const o = await (await fetch('/orders/' + orderId)).json();
+  $('#order').innerHTML =
+    `<div class="row" style="align-items:center;gap:12px"><span class="status ${o.status}">${esc(o.status)}</span>` +
+    `<span class="note">${esc(o.quantity)} x ${esc(o.sku)} &middot; ${(o.amount / 100).toFixed(2)} ${esc(o.currency.toUpperCase())}` +
+    (o.paidAt ? ` &middot; paid at ${esc(o.paidAt)}` : '') + `</span></div>` +
+    `<div class="note" style="margin-top:6px">order id <code>${esc(o.id)}</code></div>`;
+}
+
+document.addEventListener('click', async (e) => {
+  const sku = e.target.dataset && e.target.dataset.sku;
+  const scenario = e.target.dataset && e.target.dataset.scenario;
+  if (sku) {
+    const res = await fetch('/checkout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sku, quantity: 1 }) });
+    const data = await res.json();
+    orderId = data.orderId;
+    document.querySelectorAll('[data-scenario]').forEach((b) => (b.disabled = false));
+    $('#log').innerHTML = '<span class="note">Order created. Pick a scenario above.</span>';
+    await refresh();
+  }
+  if (scenario && orderId) {
+    const res = await fetch('/demo/scenario', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ orderId, scenario }) });
+    const data = await res.json();
+    $('#log').innerHTML = data.deliveries.map((d) =>
+      `<div class="entry"><span class="code ${d.status < 300 ? 'ok' : 'err'}">${d.status}</span> <b>${esc(d.label)}</b>` +
+      (d.outcome ? ` &rarr; <span class="note">outcome: ${esc(d.outcome)}</span>` : '') +
+      `<div class="note">${esc(d.note)}</div></div>`).join('');
+    await refresh();
+  }
+});
+</script>
+</body>
+</html>
